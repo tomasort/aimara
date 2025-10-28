@@ -1,0 +1,16 @@
+# Core dependencies
+yt-dlp
+openai-whisper
+
+# Configuration and logging
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# Optional: For advanced text analysis
+# spacy>=3.7.0
+# fuzzywuzzy>=0.18.0
+# python-levenshtein>=0.21.0
+
+# Optional: For web interface (future enhancement)
+# flask>=3.0.0
+# flask-cors>=4.0.0
