@@ -311,7 +311,8 @@ class DownloadProducer(threading.Thread):
     
     def __init__(self, output_queue: queue.Queue, playlist_url: str, audio_dir: str, 
                  max_videos: Optional[int] = None, chunk_length: int = 600, 
-                 extract_info: bool = True):
+                 extract_info: bool = True, cookies_from_browser: Optional[str] = None,
+                 cookies_file: Optional[str] = None):
         super().__init__(name="DownloadProducer", daemon=False)
         self.output_queue = output_queue
         self.playlist_url = playlist_url
@@ -319,6 +320,8 @@ class DownloadProducer(threading.Thread):
         self.max_videos = max_videos
         self.chunk_length = chunk_length  # Split audio into chunks of this length (seconds)
         self.extract_info = extract_info  # Whether to extract new playlist info or use existing
+        self.cookies_from_browser = cookies_from_browser
+        self.cookies_file = cookies_file
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.stop_event = threading.Event()
     
@@ -352,6 +355,23 @@ class DownloadProducer(threading.Thread):
                     break
             self._save_playlist_info(playlist_data)
     
+    def _get_ytdlp_options(self, base_options=None):
+        """Generate yt-dlp options with cookie support."""
+        if base_options is None:
+            base_options = {}
+        
+        options = base_options.copy()
+        
+        # Add cookie support
+        if self.cookies_from_browser:
+            options['cookiesfrombrowser'] = (self.cookies_from_browser, None, None, None)
+            logger.info(f"Using cookies from {self.cookies_from_browser} browser")
+        elif self.cookies_file:
+            options['cookiefile'] = self.cookies_file
+            logger.info(f"Using cookies from file: {self.cookies_file}")
+        
+        return options
+    
     def _get_next_unprocessed_videos(self, max_count=None):
         """Get the next unprocessed videos from the playlist."""
         playlist_data = self._load_playlist_info()
@@ -372,79 +392,131 @@ class DownloadProducer(threading.Thread):
                 
         return unprocessed_videos
     
-    def _download_videos(self, entries_to_download):
-        """Download and process the specified video entries."""
-        download_opts = {
-            'format': 'bestaudio/best',
+    def _download_single_video(self, entry):
+        """Download and process a single video entry."""
+        base_download_opts = {
+            # Optimized format selection for fast audio-only downloads:
+            # 1. bestaudio[acodec^=mp4a]: MP4 audio-only streams (usually fastest)
+            # 2. bestaudio[acodec^=opus]: Opus audio streams (good compression)  
+            # 3. worst[height<=480]: Low quality video as fallback (faster than best)
+            # 4. bestaudio: Any audio-only stream
+            # 5. worst: Lowest quality video (last resort)
+            'format': 'bestaudio[acodec^=mp4a]/bestaudio[acodec^=opus]/worst[height<=480]/bestaudio/worst',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '192',
+                'preferredquality': '128',  # Reduced from 192 to 128 kbps for faster downloads
             }],
             'outtmpl': str(self.audio_dir / '%(title)s.%(ext)s'),
             'quiet': False,
             'no_warnings': False,
             'no_playlist': True,  # Don't try to download as playlist
         }
+        
+        # Add cookie support
+        download_opts = self._get_ytdlp_options(base_download_opts)
 
-        for idx, entry in enumerate(entries_to_download, 1):
+        video_id = entry.get('id')
+        title = entry.get('title', 'Unknown')
+        duration = entry.get('duration')
+
+        logger.info(f"Downloading: {title}")
+
+        # Download this specific video
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        with yt_dlp.YoutubeDL(download_opts) as ydl:
+            ydl.extract_info(video_url, download=True)
+
+        # Find the most recently downloaded audio file
+        audio_files = sorted(self.audio_dir.glob('*.mp3'), key=lambda x: x.stat().st_mtime, reverse=True)
+        if audio_files:
+            audio_file = audio_files[0]
+
+            # Split audio into chunks with 20-second overlap
+            chunks = split_audio_file(str(audio_file), self.chunk_length, str(self.audio_dir), overlap_seconds=20)
+
+            # Sort chunks by chunk number to ensure sequential processing
+            def extract_chunk_number(chunk_path):
+                # Extract chunk number from filename like "video_chunk_005.mp3"
+                import re
+                match = re.search(r'_chunk_(\d+)\.mp3$', str(chunk_path))
+                return int(match.group(1)) if match else 0
+            
+            chunks_sorted = sorted(chunks, key=extract_chunk_number)
+
+            # Queue each chunk in order
+            for chunk_path in chunks_sorted:
+                # Extract chunk number from filename
+                chunk_number = extract_chunk_number(chunk_path)
+                
+                audio_obj = AudioFile(
+                    path=chunk_path,
+                    video_id=video_id,
+                    title=title,
+                    duration=duration,
+                    chunk_number=chunk_number,
+                    chunk_length=self.chunk_length,
+                    overlap_seconds=20  # This should match the overlap used in split_audio_file
+                )
+                self.output_queue.put(audio_obj)
+                logger.info(f"Queued: {audio_obj}")
+
+    def _download_videos_continuously(self):
+        """Continuously download unprocessed videos until none remain."""
+        total_downloaded = 0
+        
+        while True:
             if self.stop_event.is_set():
                 logger.info("Download producer stopped")
                 break
-
-            video_id = entry.get('id')
-            title = entry.get('title', 'Unknown')
-            duration = entry.get('duration')
-
-            logger.info(f"[{idx}/{len(entries_to_download)}] Downloading: {title}")
-
+            
+            # Get next unprocessed video (one at a time for better flow control)
+            unprocessed_videos = self._get_next_unprocessed_videos(max_count=1)
+            
+            if not unprocessed_videos:
+                logger.info("No more unprocessed videos found - download producer finished")
+                break
+            
+            entry = unprocessed_videos[0]
+            
             try:
-                # Download this specific video
-                video_url = f"https://www.youtube.com/watch?v={video_id}"
-                with yt_dlp.YoutubeDL(download_opts) as ydl:
-                    ydl.extract_info(video_url, download=True)
-
-                # Find the most recently downloaded audio file
-                audio_files = sorted(self.audio_dir.glob('*.mp3'), key=lambda x: x.stat().st_mtime, reverse=True)
-                if audio_files:
-                    audio_file = audio_files[0]
-
-                    # Split audio into chunks with 20-second overlap
-                    chunks = split_audio_file(str(audio_file), self.chunk_length, str(self.audio_dir), overlap_seconds=20)
-
-                    # Sort chunks by chunk number to ensure sequential processing
-                    def extract_chunk_number(chunk_path):
-                        # Extract chunk number from filename like "video_chunk_005.mp3"
-                        import re
-                        match = re.search(r'_chunk_(\d+)\.mp3$', str(chunk_path))
-                        return int(match.group(1)) if match else 0
-                    
-                    chunks_sorted = sorted(chunks, key=extract_chunk_number)
-
-                    # Queue each chunk in order
-                    for chunk_path in chunks_sorted:
-                        # Extract chunk number from filename
-                        chunk_number = extract_chunk_number(chunk_path)
-                        
-                        audio_obj = AudioFile(
-                            path=chunk_path,
-                            video_id=video_id,
-                            title=title,
-                            duration=duration,
-                            chunk_number=chunk_number,
-                            chunk_length=self.chunk_length,
-                            overlap_seconds=20  # This should match the overlap used in split_audio_file
-                        )
-                        self.output_queue.put(audio_obj)
-                        logger.info(f"Queued: {audio_obj}")
+                # Convert to the format expected by download method
+                download_entry = {
+                    'id': entry['id'],
+                    'title': entry['title'],
+                    'url': entry['url'],
+                    'duration': entry['duration']
+                }
+                
+                self._download_single_video(download_entry)
+                total_downloaded += 1
+                
+                logger.info(f"Completed video {total_downloaded}: {entry['title']}")
+                
+                # CRITICAL FIX: Mark successful video as processed to prevent infinite retry loop
+                self._mark_video_processed(entry['id'])
+                logger.info(f"Marked successful video as processed: {entry['title']}")
+                
+                # Brief pause to allow transcription to catch up and prevent overwhelming the system
+                # This helps maintain good flow control between download and transcription stages
+                time.sleep(2)
+                
+                # Check if we've reached max_videos limit
+                if self.max_videos and total_downloaded >= self.max_videos:
+                    logger.info(f"Reached max_videos limit ({self.max_videos})")
+                    break
 
             except Exception as e:
-                logger.warning(f"Skipping video {video_id} ({title}) due to download error: {e}")
+                logger.warning(f"Skipping video {entry['id']} ({entry['title']}) due to download error: {e}")
+                
+                # CRITICAL FIX: Mark failed video as processed to avoid infinite retry loop
+                self._mark_video_processed(entry['id'])
+                logger.info(f"Marked failed video as processed to prevent retry: {entry['title']}")
                 continue
-
+        
         # Signal end of downloads
         self.output_queue.put(None)
-        logger.info("Download producer finished")
+        logger.info(f"Download producer finished - downloaded {total_downloaded} videos")
     
     def run(self):
         """Download videos from playlist and split into chunks."""
@@ -461,61 +533,26 @@ class DownloadProducer(threading.Thread):
                 self.output_queue.put(None)
                 return
             
-            entries_to_download = self._get_next_unprocessed_videos(self.max_videos)
-            if entries_to_download:
-                logger.info(f"Found {len(entries_to_download)} unprocessed videos in existing playlist info")
-                # Convert to the format expected by the download loop
-                entries_to_download = [
-                    {
-                        'id': video['id'],
-                        'title': video['title'],
-                        'url': video['url'],
-                        'duration': video['duration']
-                    }
-                    for video in entries_to_download
-                ]
-                self._download_videos(entries_to_download)
-                return
-            else:
-                logger.info("All videos in existing playlist have been processed!")
-                self.output_queue.put(None)
-                return
+            # Use continuous downloading - will process ALL unprocessed videos
+            logger.info("Starting continuous processing of unprocessed videos...")
+            self._download_videos_continuously()
+            return
 
-        # Step 2: Check if we have existing playlist info to resume from (when extract_info=True)
-        existing_playlist_data = self._load_playlist_info()
-        if existing_playlist_data:
-            logger.info("Found existing playlist_info.json - checking for unprocessed videos")
-            entries_to_download = self._get_next_unprocessed_videos(self.max_videos)
-            
-            if entries_to_download:
-                logger.info(f"Resuming: found {len(entries_to_download)} unprocessed videos")
-                # Convert to the format expected by the download loop
-                entries_to_download = [
-                    {
-                        'id': video['id'],
-                        'title': video['title'],
-                        'url': video['url'],
-                        'duration': video['duration']
-                    }
-                    for video in entries_to_download
-                ]
-                # Skip playlist extraction and go straight to downloading
-                self._download_videos(entries_to_download)
-                return
-            else:
-                logger.info("All videos in playlist have been processed!")
-                self.output_queue.put(None)
-                return
-
-        # Step 3: Extract playlist metadata - get ALL videos (first time)
+        # Step 2: extract_info=True - Always extract fresh playlist information from the provided URL
+        logger.info("extract_info=True: Extracting fresh playlist information from provided URL...")
+        
+        # Extract playlist metadata - get ALL videos from the NEW URL
         try:
             logger.info("Extracting playlist information...")
-            extraction_opts = {
+            base_extraction_opts = {
                 'quiet': False,
                 'no_warnings': False,
                 'ignoreerrors': True,  # Skip unavailable/live videos during extraction
                 'extract_flat': True,  # Get only basic info, don't extract full metadata
             }
+            # Add cookie support for playlist extraction
+            extraction_opts = self._get_ytdlp_options(base_extraction_opts)
+            
             with yt_dlp.YoutubeDL(extraction_opts) as ydl:
                 playlist_info = ydl.extract_info(self.playlist_url, download=False)
         except Exception as e:
@@ -557,11 +594,7 @@ class DownloadProducer(threading.Thread):
 
         logger.info(f"Found {len(filtered_entries)} downloadable videos in playlist (out of {len(all_entries)} total)")
 
-        # Determine which videos to download (respect max_videos)
-        entries_to_download = filtered_entries[:self.max_videos] if self.max_videos else filtered_entries
-        logger.info(f"Will download {len(entries_to_download)} videos (limited to {self.max_videos or 'all'})")
-
-        # Step 2: Save playlist info to file - only include downloadable videos
+        # Save playlist info to file - only include downloadable videos
         playlist_data = {
             'title': playlist_title,
             'id': playlist_id,
@@ -588,10 +621,9 @@ class DownloadProducer(threading.Thread):
             json.dump(playlist_data, f, indent=2, ensure_ascii=False)
         logger.info(f"Saved playlist info ({len(filtered_entries)} available videos) to: {playlist_info_file}")
 
-        # Step 3: Download only the selected videos (respecting max_videos limit)
-        entries_to_download = filtered_entries[:self.max_videos] if self.max_videos else filtered_entries
-        logger.info(f"Will download {len(entries_to_download)} videos (limited to {self.max_videos or 'all'})")
-        self._download_videos(entries_to_download)
+        # Start continuous downloading - will process ALL videos or up to max_videos limit
+        logger.info("Starting continuous processing of all videos...")
+        self._download_videos_continuously()
 
 # =====================================================================
 # WORKER: TRANSCRIPTION STAGE
@@ -726,6 +758,18 @@ class TranscriptionWorker(threading.Thread):
                     # EntityConsumer can now start working on this while DownloadProducer
                     # is still downloading/processing other videos!
                     self.output_queue.put(transcript_chunk)
+                    
+                    # === CLEANUP: Delete the audio chunk after transcription ===
+                    # This saves disk space since we no longer need the chunk file
+                    try:
+                        chunk_path = Path(audio_file.path)
+                        if chunk_path.exists():
+                            chunk_path.unlink()
+                            logger.info(f"🗑️  Deleted audio chunk: {chunk_path.name}")
+                        else:
+                            logger.warning(f"⚠️  Audio chunk not found for deletion: {chunk_path}")
+                    except Exception as e:
+                        logger.warning(f"⚠️  Failed to delete audio chunk {audio_file.path}: {e}")
                     
                     logger.info(f"Finished transcribing and queuing: {audio_file}")
                     
@@ -896,10 +940,10 @@ class EntityConsumer(threading.Thread):
                         # Store in databases
                         self.entity_database[entity_text].append(entity_obj.to_dict())
                         self.video_entities[segment.audio_file.video_id][entity_text].append(entity_obj.to_dict())
-                    
-                    # Write to JSONL immediately for real-time visibility
-                    self._write_entity(entity_obj)
-                    self.entity_count += 1
+                        
+                        # Write to JSONL immediately for real-time visibility
+                        self._write_entity(entity_obj)
+                        self.entity_count += 1
         
         self.segment_buffer = []
         logger.info(f"Processed buffer: {self.segment_count} segments, {self.entity_count} total entities")
@@ -1055,16 +1099,22 @@ class Pipeline:
     def run(self, playlist_url: str, max_videos: Optional[int] = None,
             whisper_model: str = 'small', language: str = 'es',
             device: str = 'auto', buffer_size: int = 50, chunk_length: int = 600,
-            extract_info: bool = True):
+            extract_info: bool = True, cookies_from_browser: Optional[str] = None,
+            cookies_file: Optional[str] = None):
         """Run the full pipeline."""
         
         logger.info("=" * 80)
         logger.info("Starting Aimara Pipeline")
         logger.info("=" * 80)
         
-        # Create queues
-        download_queue = queue.Queue(maxsize=5)  # Limit queue size
-        transcription_queue = queue.Queue(maxsize=50)
+        # Create queues with flow control
+        # download_queue: Limit to prevent excessive downloading ahead of transcription
+        # Small size forces DownloadProducer to wait when TranscriptionWorker is busy
+        download_queue = queue.Queue(maxsize=3)  # ~1-2 videos worth of chunks max
+        
+        # transcription_queue: Smaller size since EntityConsumer is very fast
+        # Large buffer here would just consume memory unnecessarily
+        transcription_queue = queue.Queue(maxsize=10)  # Enough to keep EntityConsumer busy
         
         # Create threads
         downloader = DownloadProducer(
@@ -1073,7 +1123,9 @@ class Pipeline:
             str(self.audio_dir),
             max_videos=max_videos,
             chunk_length=chunk_length,
-            extract_info=extract_info
+            extract_info=extract_info,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file
         )
         
         transcriber = TranscriptionWorker(
@@ -1088,7 +1140,7 @@ class Pipeline:
         extractor = EntityConsumer(
             transcription_queue,
             str(self.transcripts_dir),
-            buffer_size=buffer_size,
+            buffer_size=10,  # Reduced from default 50 to prevent memory issues
             video_completion_callback=downloader._mark_video_processed
         )
         

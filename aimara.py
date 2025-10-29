@@ -411,7 +411,9 @@ def cleanup(keep_audio, keep_transcripts):
 @click.option('--buffer-size', default=50, help='Entity extraction buffer size')
 @click.option('--chunk-length', default=600, type=int, help='Audio chunk length in seconds (default: 600 = 10 minutes)')
 @click.option('--info/--no-info', default=True, help='Extract playlist info (True) or use existing playlist_info.json (False)')
-def pipeline_process(playlist_url, max_videos, model, language, device, buffer_size, chunk_length, info):
+@click.option('--cookies-from-browser', type=click.Choice(['chrome', 'firefox', 'safari', 'edge']), help='Extract cookies from browser to avoid bot detection')
+@click.option('--cookies-file', type=click.Path(exists=True), help='Path to Netscape cookies file')
+def pipeline_process(playlist_url, max_videos, model, language, device, buffer_size, chunk_length, info, cookies_from_browser, cookies_file):
     """
     🚀 MAIN COMMAND: Process YouTube playlist through complete pipeline.
     
@@ -430,9 +432,15 @@ def pipeline_process(playlist_url, max_videos, model, language, device, buffer_s
     - Use --no-info to use existing playlist_info.json (allows manual video selection)
     - Edit playlist_info.json to set "processed": true for videos you want to skip
     
-    Example:
+    BOT DETECTION AVOIDANCE:
+    - Use --cookies-from-browser chrome/firefox/safari/edge to extract browser cookies
+    - Use --cookies-file path/to/cookies.txt to use custom Netscape cookies file
+    - Helps bypass YouTube's "Sign in to confirm you're not a bot" errors
+    
+    Examples:
         uv run aimara.py pipeline-process "https://youtube.com/playlist?list=..." --max-videos 2
         uv run aimara.py pipeline-process "URL" --no-info  # Use existing playlist_info.json
+        uv run aimara.py pipeline-process "URL" --cookies-from-browser chrome  # Avoid bot detection
     """
     
     click.echo("=" * 80)
@@ -446,6 +454,15 @@ def pipeline_process(playlist_url, max_videos, model, language, device, buffer_s
     click.echo(f"📦 Buffer size: {buffer_size}")
     click.echo(f"✂️  Chunk length: {chunk_length}s (~{chunk_length/60:.0f} minutes)")
     click.echo(f"📄 Extract info: {'Yes' if info else 'No (use existing playlist_info.json)'}")
+    
+    # Show cookies configuration
+    if cookies_from_browser:
+        click.echo(f"🍪 Cookies: From {cookies_from_browser} browser")
+    elif cookies_file:
+        click.echo(f"🍪 Cookies: From file {cookies_file}")
+    else:
+        click.echo("🍪 Cookies: None (may encounter bot detection)")
+    
     click.echo("=" * 80)
     
     try:
@@ -462,7 +479,9 @@ def pipeline_process(playlist_url, max_videos, model, language, device, buffer_s
             device=device,
             buffer_size=buffer_size,
             chunk_length=chunk_length,
-            extract_info=info
+            extract_info=info,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file
         )
         
         click.echo("\n✅ Pipeline completed successfully!")
