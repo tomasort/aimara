@@ -1,0 +1,18 @@
+[project]
+name = "aimara"
+version = "0.1.0"
+description = "YouTube playlist video processing - download, transcribe, and search for keywords"
+dependencies = [
+    "yt-dlp",
+    "openai-whisper",
+    # Note: torch and torchaudio will be pulled by whisper
+    # but may have platform compatibility issues on Intel Mac
+    # Consider using: pip install torch --index-url https://download.pytorch.org/whl/cpu
+    "pydub",
+    "regex",
+    "nltk",
+    "requests",
+    "tqdm",
+    "pyyaml",
+    "python-dotenv",
+]
