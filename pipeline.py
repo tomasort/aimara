@@ -84,6 +84,62 @@ class AudioFile:
 # UTILITY FUNCTIONS
 # =====================================================================
 
+def format_srt_time(srt_time: str) -> str:
+    """Convert SRT time format '00:01:23,456' to '[0:01:23]' format."""
+    # Remove milliseconds and convert to [H:MM:SS] or [MM:SS] format
+    time_part = srt_time.split(',')[0]  # Remove milliseconds
+    parts = time_part.split(':')
+    hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2])
+    
+    if hours > 0:
+        return f"[{hours}:{minutes:02d}:{seconds:02d}]"
+    else:
+        return f"[{minutes}:{seconds:02d}]"
+
+def parse_srt_to_timestamped_text(srt_content: str, chunk_offset: float = 0.0) -> str:
+    """
+    Parse SRT content and return timestamped text in format: [0:01:23] text
+    
+    Args:
+        srt_content: SRT format string from Whisper
+        chunk_offset: Offset in seconds to add to timestamps for chunk alignment
+    
+    Returns:
+        Formatted text with timestamps
+    """
+    blocks = srt_content.strip().split('\n\n')
+    processed_lines = []
+    
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) >= 3:
+            # SRT format: index, time_range, text
+            time_range = lines[1]
+            text = '\n'.join(lines[2:])  # Handle multi-line text
+            
+            # Extract start time
+            start_time_str = time_range.split(' --> ')[0]
+            
+            # If we have a chunk offset, we need to adjust the timestamp
+            if chunk_offset > 0:
+                # Convert SRT time to seconds, add offset, convert back
+                time_parts = start_time_str.replace(',', '.').split(':')
+                total_seconds = int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + float(time_parts[2])
+                adjusted_seconds = total_seconds + chunk_offset
+                
+                # Convert back to SRT format for formatting
+                hours = int(adjusted_seconds // 3600)
+                minutes = int((adjusted_seconds % 3600) // 60)
+                seconds = int(adjusted_seconds % 60)
+                start_time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d},000"
+            
+            # Format the timestamp
+            formatted_time = format_srt_time(start_time_str)
+            processed_line = f"{formatted_time} {text}"
+            processed_lines.append(processed_line)
+    
+    return '\n'.join(processed_lines)
+
 def split_audio_file(audio_path: str, chunk_length_seconds: int = 600, output_dir: str = None, overlap_seconds: int = 20) -> List[str]:
     """
     Split an audio file into smaller chunks with optional overlap.
@@ -276,6 +332,7 @@ class DownloadProducer(threading.Thread):
                 'quiet': False,
                 'no_warnings': False,
                 'ignoreerrors': True,  # Skip unavailable/live videos during extraction
+                'extract_flat': True,  # Get only basic info, don't extract full metadata
             }
             with yt_dlp.YoutubeDL(extraction_opts) as ydl:
                 playlist_info = ydl.extract_info(self.playlist_url, download=False)
@@ -302,10 +359,14 @@ class DownloadProducer(threading.Thread):
             playlist_title = f"Single Video: {playlist_info.get('title', 'Unknown')}"
             logger.info(f"Processing single video: {playlist_info.get('title', 'Unknown')}")
 
-
         # Filter out live/unavailable videos
         filtered_entries = []
         for entry in all_entries:
+            # Skip None entries (yt-dlp can return None for truly unavailable videos)
+            if entry is None:
+                logger.warning("Skipping None entry (unavailable video)")
+                continue
+                
             # yt-dlp marks unavailable/live videos with 'is_live' or missing 'duration'
             if entry.get('is_live') or entry.get('duration') is None:
                 logger.warning(f"Skipping unavailable/live video: {entry.get('title', 'Unknown')} ({entry.get('id')})")
@@ -511,7 +572,7 @@ class TranscriptionWorker(threading.Thread):
                     result = self.model.transcribe(
                         audio_file.path,
                         language=self.language,
-                        verbose=True,  # Show real-time progress
+                        verbose=False,  # Show real-time progress
                         fp16=False,  # Disable half-precision to avoid NaN issues
                     )
                     
@@ -521,11 +582,22 @@ class TranscriptionWorker(threading.Thread):
                     # === KEY FEATURE: Write transcript to file IMMEDIATELY ===
                     # This enables real-time progress visibility and means we don't lose data
                     # if the process is interrupted during entity extraction.
-                    chunk_text = '\n'.join([seg['text'] for seg in segments])
+                    
+                    # Create SRT content from segments for timestamp formatting
+                    srt_content = ""
+                    for i, seg in enumerate(segments, 1):
+                        start_time = f"{int(seg['start']//3600):02d}:{int((seg['start']%3600)//60):02d}:{int(seg['start']%60):02d},{int((seg['start']%1)*1000):03d}"
+                        end_time = f"{int(seg['end']//3600):02d}:{int((seg['end']%3600)//60):02d}:{int(seg['end']%60):02d},{int((seg['end']%1)*1000):03d}"
+                        srt_content += f"{i}\n{start_time} --> {end_time}\n{seg['text'].strip()}\n\n"
+                    
+                    # Parse SRT to timestamped text with chunk offset
+                    chunk_offset = audio_file.get_time_offset()
+                    timestamped_text = parse_srt_to_timestamped_text(srt_content, chunk_offset)
+                    
                     transcript_file = self._get_or_create_transcript_file(audio_file)
                     
                     with open(transcript_file, 'a', encoding='utf-8') as f:
-                        f.write(chunk_text + '\n')
+                        f.write(timestamped_text + '\n')
                         f.flush()  # Ensure data is written to disk immediately
                     
                     logger.info(f"✓ Wrote transcript chunk to: {transcript_file}")
@@ -546,7 +618,7 @@ class TranscriptionWorker(threading.Thread):
                             )
                             for seg in segments
                         ],
-                        full_text=chunk_text
+                        full_text='\n'.join([seg['text'] for seg in segments])  # Plain text for entity extraction
                     )
                     
                     # Queue the complete chunk for entity extraction
@@ -704,9 +776,10 @@ class EntityConsumer(threading.Thread):
                         self.entity_counts[ent.label_][entity_text] += 1
                         
                         # Calculate real timestamps relative to the complete video
-                        chunk_offset = segment.audio_file.get_time_offset()
-                        real_start_time = segment.start_time + chunk_offset
-                        real_end_time = segment.end_time + chunk_offset
+                        # NOTE: segment.start_time and segment.end_time already include chunk_offset
+                        # from the TranscriptionWorker, so don't add it again!
+                        real_start_time = segment.start_time
+                        real_end_time = segment.end_time
                         
                         entity_obj = Entity(
                             text=entity_text,
@@ -786,12 +859,29 @@ class EntityConsumer(threading.Thread):
             safe_title = "".join(c for c in video_title if c.isalnum() or c in (' ', '-', '_')).rstrip()
             
             # ===== SAVE TRANSCRIPT FILES =====
-            # 1. Plain text transcript
+            # 1. Plain text transcript with timestamps
             transcript_file = video_transcripts_dir / f"{safe_title}_transcript.txt"
-            full_text = '\n'.join([seg.text for seg in segments])
+            
+            # Create timestamped text from segments
+            timestamped_lines = []
+            for seg in segments:
+                # Format timestamp like [0:01:23]
+                start_seconds = int(seg.start_time)
+                hours = start_seconds // 3600
+                minutes = (start_seconds % 3600) // 60
+                seconds = start_seconds % 60
+                
+                if hours > 0:
+                    timestamp = f"[{hours}:{minutes:02d}:{seconds:02d}]"
+                else:
+                    timestamp = f"[{minutes}:{seconds:02d}]"
+                
+                timestamped_lines.append(f"{timestamp} {seg.text}")
+            
+            full_text_with_timestamps = '\n'.join(timestamped_lines)
             
             with open(transcript_file, 'w', encoding='utf-8') as f:
-                f.write(full_text)
+                f.write(full_text_with_timestamps)
             
             # 2. Structured transcript with timestamps
             transcript_json = video_transcripts_dir / f"{safe_title}_transcript.json"
@@ -799,7 +889,8 @@ class EntityConsumer(threading.Thread):
                 'video_id': video_id,
                 'video_title': video_title,
                 'total_segments': len(segments),
-                'text': full_text,
+                'text': '\n'.join([seg.text for seg in segments]),  # Plain text without timestamps
+                'text_with_timestamps': full_text_with_timestamps,  # Text with timestamps
                 'segments': [
                     {
                         'start': seg.start_time,
