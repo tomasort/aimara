@@ -10,7 +10,8 @@ A streamlined command-line utility for processing YouTube content:
 - Searching extracted entities and transcripts
 
 Main Commands:
-    aimara playlist <playlist_url>                    # Get playlist info
+    aimara extract-playlist <playlist_url>            # Extract playlist info only
+    aimara playlist <playlist_url>                    # Get playlist info (legacy)
     aimara download <video_url>                       # Download single video audio
     aimara pipeline-process <playlist_url>            # Full pipeline (recommended)
     aimara search <query>                             # Search entities
@@ -19,6 +20,8 @@ Main Commands:
 
 The pipeline-process command is the main feature - it downloads, transcribes,
 and extracts entities from playlists using a multi-threaded architecture.
+
+Use extract-playlist first to preview and manually select videos before processing.
 """
 
 import click
@@ -74,8 +77,10 @@ def cli(output_dir, verbose):
     Aimara - YouTube Playlist Processing Pipeline
     
     🚀 Main command: pipeline-process PLAYLIST_URL
+    📄 New: extract-playlist PLAYLIST_URL (info only)
     
     Downloads videos, transcribes audio, and extracts entities in parallel.
+    Use extract-playlist first to preview and select videos manually.
     """
     config.output_dir = Path(output_dir)
     config.audio_dir = config.output_dir / "audio"
@@ -405,7 +410,8 @@ def cleanup(keep_audio, keep_transcripts):
 @click.option('--device', type=click.Choice(['cpu', 'cuda', 'mps', 'auto']), default='auto', help='Processing device')
 @click.option('--buffer-size', default=50, help='Entity extraction buffer size')
 @click.option('--chunk-length', default=600, type=int, help='Audio chunk length in seconds (default: 600 = 10 minutes)')
-def pipeline_process(playlist_url, max_videos, model, language, device, buffer_size, chunk_length):
+@click.option('--info/--no-info', default=True, help='Extract playlist info (True) or use existing playlist_info.json (False)')
+def pipeline_process(playlist_url, max_videos, model, language, device, buffer_size, chunk_length, info):
     """
     🚀 MAIN COMMAND: Process YouTube playlist through complete pipeline.
     
@@ -419,8 +425,14 @@ def pipeline_process(playlist_url, max_videos, model, language, device, buffer_s
     Multi-threaded producer-consumer architecture ensures maximum efficiency.
     Results are written to files as they're processed (real-time progress).
     
+    PLAYLIST CONTROL:
+    - Use --info (default) to extract fresh playlist information
+    - Use --no-info to use existing playlist_info.json (allows manual video selection)
+    - Edit playlist_info.json to set "processed": true for videos you want to skip
+    
     Example:
         uv run aimara.py pipeline-process "https://youtube.com/playlist?list=..." --max-videos 2
+        uv run aimara.py pipeline-process "URL" --no-info  # Use existing playlist_info.json
     """
     
     click.echo("=" * 80)
@@ -433,6 +445,7 @@ def pipeline_process(playlist_url, max_videos, model, language, device, buffer_s
     click.echo(f"💻 Device: {device}")
     click.echo(f"📦 Buffer size: {buffer_size}")
     click.echo(f"✂️  Chunk length: {chunk_length}s (~{chunk_length/60:.0f} minutes)")
+    click.echo(f"📄 Extract info: {'Yes' if info else 'No (use existing playlist_info.json)'}")
     click.echo("=" * 80)
     
     try:
@@ -448,7 +461,8 @@ def pipeline_process(playlist_url, max_videos, model, language, device, buffer_s
             language=language,
             device=device,
             buffer_size=buffer_size,
-            chunk_length=chunk_length
+            chunk_length=chunk_length,
+            extract_info=info
         )
         
         click.echo("\n✅ Pipeline completed successfully!")
@@ -466,6 +480,119 @@ def pipeline_process(playlist_url, max_videos, model, language, device, buffer_s
         
     except Exception as e:
         click.echo(f"❌ Pipeline error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+@cli.command('extract-playlist')
+@click.argument('playlist_url')
+def extract_playlist(playlist_url):
+    """
+    📄 Extract playlist information only (no downloading/transcribing).
+    
+    This command extracts playlist metadata and saves it to playlist_info.json
+    without running the full pipeline. Useful for:
+    - Previewing playlist contents before processing
+    - Manual video selection (edit playlist_info.json afterwards)
+    - Planning processing workload
+    
+    After extraction, you can:
+    1. Review the generated playlist_info.json file
+    2. Edit it to set "processed": true for videos you want to skip
+    3. Run pipeline-process with --no-info to use your edited playlist
+    
+    Example:
+        uv run aimara.py extract-playlist "https://youtube.com/playlist?list=..."
+    """
+    
+    click.echo("=" * 80)
+    click.echo("📄 Extracting Playlist Information Only")
+    click.echo("=" * 80)
+    click.echo(f"📺 Playlist URL: {playlist_url}")
+    click.echo("=" * 80)
+    
+    try:
+        import yt_dlp
+        from pathlib import Path
+        
+        # Extract playlist metadata
+        click.echo("🔍 Extracting playlist information...")
+        extraction_opts = {
+            'quiet': False,
+            'no_warnings': False,
+            'ignoreerrors': True,  # Skip unavailable/live videos during extraction
+            'extract_flat': True,  # Get only basic info, don't extract full metadata
+        }
+        
+        with yt_dlp.YoutubeDL(extraction_opts) as ydl:
+            playlist_info = ydl.extract_info(playlist_url, download=False)
+        
+        if playlist_info is None:
+            click.echo("❌ Failed to extract playlist information - playlist may not exist or be private")
+            sys.exit(1)
+        
+        # Get playlist details
+        playlist_title = playlist_info.get('title', 'Unknown Playlist')
+        playlist_id = playlist_info.get('id', 'Unknown ID')
+        all_entries = playlist_info.get('entries', [])
+        
+        # Handle single video case
+        if not all_entries and playlist_info.get('id'):
+            all_entries = [playlist_info]
+            playlist_title = f"Single Video: {playlist_info.get('title', 'Unknown')}"
+            click.echo(f"📺 Processing single video: {playlist_info.get('title', 'Unknown')}")
+        
+        # Filter out live/unavailable videos
+        filtered_entries = []
+        for entry in all_entries:
+            if entry is None:
+                continue
+            if entry.get('is_live') or entry.get('duration') is None:
+                click.echo(f"⚠️  Skipping unavailable/live video: {entry.get('title', 'Unknown')} ({entry.get('id')})")
+                continue
+            filtered_entries.append(entry)
+        
+        click.echo(f"✅ Found {len(filtered_entries)} available videos (out of {len(all_entries)} total)")
+        
+        # Create simplified playlist data structure
+        playlist_data = {
+            'title': playlist_title,
+            'id': playlist_id,
+            'url': playlist_url,
+            'total_videos_found': len(all_entries),
+            'available_videos': len(filtered_entries),
+            'extracted_at': datetime.now().isoformat(),
+            'videos': [
+                {
+                    'id': entry.get('id'),
+                    'title': entry.get('title'),
+                    'url': f"https://www.youtube.com/watch?v={entry.get('id')}",
+                    'duration': entry.get('duration'),
+                    'processed': False,  # Track processing status
+                }
+                for entry in filtered_entries
+            ]
+        }
+        
+        # Save to playlist_info.json
+        playlist_file = Path('playlist_info.json')
+        with open(playlist_file, 'w', encoding='utf-8') as f:
+            json.dump(playlist_data, f, indent=2, ensure_ascii=False)
+        
+        click.echo("=" * 80)
+        click.echo("✅ Playlist extraction completed!")
+        click.echo(f"📁 Saved to: {playlist_file}")
+        click.echo(f"📊 Playlist: {playlist_title}")
+        click.echo(f"🎥 Available videos: {len(filtered_entries)}")
+        click.echo("")
+        click.echo("Next steps:")
+        click.echo("1. Review playlist_info.json to see all videos")
+        click.echo("2. Edit playlist_info.json to set 'processed': true for videos to skip")
+        click.echo("3. Run: uv run aimara.py pipeline-process ANY_URL --no-info")
+        click.echo("=" * 80)
+        
+    except Exception as e:
+        click.echo(f"❌ Extraction error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

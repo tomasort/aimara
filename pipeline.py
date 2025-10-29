@@ -310,116 +310,70 @@ class DownloadProducer(threading.Thread):
     """Producer thread that downloads videos and queues audio files."""
     
     def __init__(self, output_queue: queue.Queue, playlist_url: str, audio_dir: str, 
-                 max_videos: Optional[int] = None, chunk_length: int = 600):
+                 max_videos: Optional[int] = None, chunk_length: int = 600, 
+                 extract_info: bool = True):
         super().__init__(name="DownloadProducer", daemon=False)
         self.output_queue = output_queue
         self.playlist_url = playlist_url
         self.audio_dir = Path(audio_dir)
         self.max_videos = max_videos
         self.chunk_length = chunk_length  # Split audio into chunks of this length (seconds)
+        self.extract_info = extract_info  # Whether to extract new playlist info or use existing
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.stop_event = threading.Event()
     
-    def run(self):
-        """Download videos from playlist and split into chunks."""
-        logger.info(f"Starting download from: {self.playlist_url}")
-        logger.info(f"Audio chunks will be {self.chunk_length}s (~{self.chunk_length/60:.0f} minutes) each")
-
-        # Step 1: Extract playlist metadata - get ALL videos
-        try:
-            logger.info("Extracting playlist information...")
-            extraction_opts = {
-                'quiet': False,
-                'no_warnings': False,
-                'ignoreerrors': True,  # Skip unavailable/live videos during extraction
-                'extract_flat': True,  # Get only basic info, don't extract full metadata
-            }
-            with yt_dlp.YoutubeDL(extraction_opts) as ydl:
-                playlist_info = ydl.extract_info(self.playlist_url, download=False)
-        except Exception as e:
-            logger.error(f"Unrecoverable error extracting playlist info: {e}")
-            self.output_queue.put(None)
-            return
-
-        # Handle case where playlist extraction returns None
-        if playlist_info is None:
-            logger.error("Failed to extract playlist information - playlist may not exist or be private")
-            self.output_queue.put(None)
-            return
-
-        # Get playlist details
-        playlist_title = playlist_info.get('title', 'Unknown Playlist')
-        playlist_id = playlist_info.get('id', 'Unknown ID')
-        all_entries = playlist_info.get('entries', [])
-        
-        # Handle single video case (when URL is not a playlist)
-        if not all_entries and playlist_info.get('id'):
-            # This is a single video, not a playlist
-            all_entries = [playlist_info]
-            playlist_title = f"Single Video: {playlist_info.get('title', 'Unknown')}"
-            logger.info(f"Processing single video: {playlist_info.get('title', 'Unknown')}")
-
-        # Filter out live/unavailable videos
-        filtered_entries = []
-        for entry in all_entries:
-            # Skip None entries (yt-dlp can return None for truly unavailable videos)
-            if entry is None:
-                logger.warning("Skipping None entry (unavailable video)")
-                continue
-                
-            # yt-dlp marks unavailable/live videos with 'is_live' or missing 'duration'
-            if entry.get('is_live') or entry.get('duration') is None:
-                logger.warning(f"Skipping unavailable/live video: {entry.get('title', 'Unknown')} ({entry.get('id')})")
-                continue
-            filtered_entries.append(entry)
-
-        logger.info(f"Found {len(filtered_entries)} downloadable videos in playlist (out of {len(all_entries)} total)")
-
-        # Determine which videos to download (respect max_videos)
-        entries_to_download = filtered_entries[:self.max_videos] if self.max_videos else filtered_entries
-        logger.info(f"Will download {len(entries_to_download)} videos (limited to {self.max_videos or 'all'})")
-
-        # Step 2: Save playlist info to file with ALL videos (not limited)
-        playlist_data = {
-            'title': playlist_title,
-            'id': playlist_id,
-            'url': self.playlist_url,
-            'total_videos': len(all_entries),
-            'downloadable_videos': len(filtered_entries),
-            'max_videos_limit': self.max_videos,
-            'videos_to_process': len(entries_to_download),
-            'extracted_at': datetime.now().isoformat(),
-            'all_videos': [
-                {
-                    'index': idx,
-                    'id': entry.get('id'),
-                    'title': entry.get('title'),
-                    'url': f"https://www.youtube.com/watch?v={entry.get('id')}",
-                    'duration': entry.get('duration'),
-                    'is_live': entry.get('is_live', False),
-                }
-                for idx, entry in enumerate(all_entries, 1)
-            ],
-            'downloadable_videos_info': [
-                {
-                    'index': idx,
-                    'id': entry.get('id'),
-                    'title': entry.get('title'),
-                    'url': f"https://www.youtube.com/watch?v={entry.get('id')}",
-                    'duration': entry.get('duration'),
-                }
-                for idx, entry in enumerate(filtered_entries, 1)
-            ]
-        }
-
-        # Save playlist info in output directory
-        output_dir = Path(self.audio_dir).parent  # Go up one level to output dir
-        playlist_info_file = output_dir / 'playlist_info.json'
-        with open(playlist_info_file, 'w', encoding='utf-8') as f:
+    def _get_playlist_info_file(self):
+        """Get the path to the playlist_info.json file."""
+        output_dir = Path(self.audio_dir).parent
+        return output_dir / 'playlist_info.json'
+    
+    def _load_playlist_info(self):
+        """Load playlist info from JSON file."""
+        playlist_file = self._get_playlist_info_file()
+        if playlist_file.exists():
+            with open(playlist_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return None
+    
+    def _save_playlist_info(self, playlist_data):
+        """Save playlist info to JSON file."""
+        playlist_file = self._get_playlist_info_file()
+        with open(playlist_file, 'w', encoding='utf-8') as f:
             json.dump(playlist_data, f, indent=2, ensure_ascii=False)
-        logger.info(f"Saved playlist info (all {len(all_entries)} videos) to: {playlist_info_file}")
-
-        # Step 3: Download only the selected videos
+    
+    def _mark_video_processed(self, video_id):
+        """Mark a video as processed in the playlist_info.json file."""
+        playlist_data = self._load_playlist_info()
+        if playlist_data:
+            for video in playlist_data['videos']:
+                if video['id'] == video_id:
+                    video['processed'] = True
+                    logger.info(f"Marked video as processed: {video['title']} ({video_id})")
+                    break
+            self._save_playlist_info(playlist_data)
+    
+    def _get_next_unprocessed_videos(self, max_count=None):
+        """Get the next unprocessed videos from the playlist."""
+        playlist_data = self._load_playlist_info()
+        if not playlist_data:
+            return []
+        
+        unprocessed_videos = []
+        for video in playlist_data['videos']:
+            # Skip if already processed
+            if video.get('processed', False):
+                continue
+            
+            unprocessed_videos.append(video)
+            
+            # Stop if we have enough videos
+            if max_count and len(unprocessed_videos) >= max_count:
+                break
+                
+        return unprocessed_videos
+    
+    def _download_videos(self, entries_to_download):
+        """Download and process the specified video entries."""
         download_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -491,6 +445,153 @@ class DownloadProducer(threading.Thread):
         # Signal end of downloads
         self.output_queue.put(None)
         logger.info("Download producer finished")
+    
+    def run(self):
+        """Download videos from playlist and split into chunks."""
+        logger.info(f"Starting download from: {self.playlist_url}")
+        logger.info(f"Audio chunks will be {self.chunk_length}s (~{self.chunk_length/60:.0f} minutes) each")
+
+        # Step 1: Check extract_info flag
+        if not self.extract_info:
+            logger.info("extract_info=False: Using existing playlist_info.json only")
+            existing_playlist_data = self._load_playlist_info()
+            if not existing_playlist_data:
+                logger.error("No existing playlist_info.json found and extract_info=False. Cannot proceed.")
+                logger.error("Either run with --info to extract playlist info, or ensure playlist_info.json exists.")
+                self.output_queue.put(None)
+                return
+            
+            entries_to_download = self._get_next_unprocessed_videos(self.max_videos)
+            if entries_to_download:
+                logger.info(f"Found {len(entries_to_download)} unprocessed videos in existing playlist info")
+                # Convert to the format expected by the download loop
+                entries_to_download = [
+                    {
+                        'id': video['id'],
+                        'title': video['title'],
+                        'url': video['url'],
+                        'duration': video['duration']
+                    }
+                    for video in entries_to_download
+                ]
+                self._download_videos(entries_to_download)
+                return
+            else:
+                logger.info("All videos in existing playlist have been processed!")
+                self.output_queue.put(None)
+                return
+
+        # Step 2: Check if we have existing playlist info to resume from (when extract_info=True)
+        existing_playlist_data = self._load_playlist_info()
+        if existing_playlist_data:
+            logger.info("Found existing playlist_info.json - checking for unprocessed videos")
+            entries_to_download = self._get_next_unprocessed_videos(self.max_videos)
+            
+            if entries_to_download:
+                logger.info(f"Resuming: found {len(entries_to_download)} unprocessed videos")
+                # Convert to the format expected by the download loop
+                entries_to_download = [
+                    {
+                        'id': video['id'],
+                        'title': video['title'],
+                        'url': video['url'],
+                        'duration': video['duration']
+                    }
+                    for video in entries_to_download
+                ]
+                # Skip playlist extraction and go straight to downloading
+                self._download_videos(entries_to_download)
+                return
+            else:
+                logger.info("All videos in playlist have been processed!")
+                self.output_queue.put(None)
+                return
+
+        # Step 3: Extract playlist metadata - get ALL videos (first time)
+        try:
+            logger.info("Extracting playlist information...")
+            extraction_opts = {
+                'quiet': False,
+                'no_warnings': False,
+                'ignoreerrors': True,  # Skip unavailable/live videos during extraction
+                'extract_flat': True,  # Get only basic info, don't extract full metadata
+            }
+            with yt_dlp.YoutubeDL(extraction_opts) as ydl:
+                playlist_info = ydl.extract_info(self.playlist_url, download=False)
+        except Exception as e:
+            logger.error(f"Unrecoverable error extracting playlist info: {e}")
+            self.output_queue.put(None)
+            return
+
+        # Handle case where playlist extraction returns None
+        if playlist_info is None:
+            logger.error("Failed to extract playlist information - playlist may not exist or be private")
+            self.output_queue.put(None)
+            return
+
+        # Get playlist details
+        playlist_title = playlist_info.get('title', 'Unknown Playlist')
+        playlist_id = playlist_info.get('id', 'Unknown ID')
+        all_entries = playlist_info.get('entries', [])
+        
+        # Handle single video case (when URL is not a playlist)
+        if not all_entries and playlist_info.get('id'):
+            # This is a single video, not a playlist
+            all_entries = [playlist_info]
+            playlist_title = f"Single Video: {playlist_info.get('title', 'Unknown')}"
+            logger.info(f"Processing single video: {playlist_info.get('title', 'Unknown')}")
+
+        # Filter out live/unavailable videos
+        filtered_entries = []
+        for entry in all_entries:
+            # Skip None entries (yt-dlp can return None for truly unavailable videos)
+            if entry is None:
+                logger.warning("Skipping None entry (unavailable video)")
+                continue
+                
+            # yt-dlp marks unavailable/live videos with 'is_live' or missing 'duration'
+            if entry.get('is_live') or entry.get('duration') is None:
+                logger.warning(f"Skipping unavailable/live video: {entry.get('title', 'Unknown')} ({entry.get('id')})")
+                continue
+            filtered_entries.append(entry)
+
+        logger.info(f"Found {len(filtered_entries)} downloadable videos in playlist (out of {len(all_entries)} total)")
+
+        # Determine which videos to download (respect max_videos)
+        entries_to_download = filtered_entries[:self.max_videos] if self.max_videos else filtered_entries
+        logger.info(f"Will download {len(entries_to_download)} videos (limited to {self.max_videos or 'all'})")
+
+        # Step 2: Save playlist info to file - only include downloadable videos
+        playlist_data = {
+            'title': playlist_title,
+            'id': playlist_id,
+            'url': self.playlist_url,
+            'total_videos_found': len(all_entries),
+            'available_videos': len(filtered_entries),
+            'extracted_at': datetime.now().isoformat(),
+            'videos': [
+                {
+                    'id': entry.get('id'),
+                    'title': entry.get('title'),
+                    'url': f"https://www.youtube.com/watch?v={entry.get('id')}",
+                    'duration': entry.get('duration'),
+                    'processed': False,  # Track processing status
+                }
+                for entry in filtered_entries
+            ]
+        }
+
+        # Save playlist info in output directory
+        output_dir = Path(self.audio_dir).parent  # Go up one level to output dir
+        playlist_info_file = output_dir / 'playlist_info.json'
+        with open(playlist_info_file, 'w', encoding='utf-8') as f:
+            json.dump(playlist_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved playlist info ({len(filtered_entries)} available videos) to: {playlist_info_file}")
+
+        # Step 3: Download only the selected videos (respecting max_videos limit)
+        entries_to_download = filtered_entries[:self.max_videos] if self.max_videos else filtered_entries
+        logger.info(f"Will download {len(entries_to_download)} videos (limited to {self.max_videos or 'all'})")
+        self._download_videos(entries_to_download)
 
 # =====================================================================
 # WORKER: TRANSCRIPTION STAGE
@@ -647,11 +748,13 @@ class EntityConsumer(threading.Thread):
     """Consumer thread that extracts entities from transcribed segments."""
     
     def __init__(self, input_queue: queue.Queue, output_dir: str, 
-                 buffer_size: int = 50, spacy_model: str = 'es_core_news_lg'):
+                 buffer_size: int = 50, spacy_model: str = 'es_core_news_lg',
+                 video_completion_callback=None):
         super().__init__(name="EntityConsumer", daemon=False)
         self.input_queue = input_queue
         self.output_dir = Path(output_dir)
         self.buffer_size = buffer_size
+        self.video_completion_callback = video_completion_callback
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Load spaCy model with fallback
@@ -929,6 +1032,10 @@ class EntityConsumer(threading.Thread):
                 json.dump(video_entity_data, f, indent=2, ensure_ascii=False)
             
             logger.info(f"Saved entities for {video_title} to: {entities_file}")
+            
+            # Mark video as processed in playlist_info.json
+            if self.video_completion_callback:
+                self.video_completion_callback(video_id)
 
 # =====================================================================
 # PIPELINE ORCHESTRATOR
@@ -947,7 +1054,8 @@ class Pipeline:
     
     def run(self, playlist_url: str, max_videos: Optional[int] = None,
             whisper_model: str = 'small', language: str = 'es',
-            device: str = 'auto', buffer_size: int = 50, chunk_length: int = 600):
+            device: str = 'auto', buffer_size: int = 50, chunk_length: int = 600,
+            extract_info: bool = True):
         """Run the full pipeline."""
         
         logger.info("=" * 80)
@@ -964,7 +1072,8 @@ class Pipeline:
             playlist_url, 
             str(self.audio_dir),
             max_videos=max_videos,
-            chunk_length=chunk_length
+            chunk_length=chunk_length,
+            extract_info=extract_info
         )
         
         transcriber = TranscriptionWorker(
@@ -979,7 +1088,8 @@ class Pipeline:
         extractor = EntityConsumer(
             transcription_queue,
             str(self.transcripts_dir),
-            buffer_size=buffer_size
+            buffer_size=buffer_size,
+            video_completion_callback=downloader._mark_video_processed
         )
         
         # Start threads
