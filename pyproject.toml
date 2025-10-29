@@ -2,7 +2,7 @@
 name = "aimara"
 version = "0.1.0"
 description = "YouTube playlist video processing - download, transcribe, and search for keywords"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "yt-dlp",
     "openai-whisper",
@@ -19,4 +19,15 @@ dependencies = [
     "spacy>=3.7.0",
     "click>=8.3.0",
     "torch>=2.9.0",
+    "es-core-news-lg",
+    "whispercpp>=0.0.17",
 ]
+
+[project.optional-dependencies]
+# Fast transcription with whisper.cpp (optional but recommended)
+fast = [
+    "whispercpp",
+]
+
+[tool.uv.sources]
+es-core-news-lg = { url = "https://github.com/explosion/spacy-models/releases/download/es_core_news_lg-3.8.0/es_core_news_lg-3.8.0-py3-none-any.whl" }

@@ -686,8 +686,10 @@ class TranscriptionWorker(threading.Thread):
         """
         try:
             logger.info(f"Loading Whisper model: {self.model_name} (device: {self.device})")
+            
+            # Load standard Python whisper model
             self.model = whisper.load_model(self.model_name, device=self.device)
-            logger.info(f"Model loaded successfully")
+            logger.info(f"Loaded Python Whisper model: {self.model_name} (device: {self.device})")
             
             while not self.stop_event.is_set():
                 try:
@@ -701,7 +703,7 @@ class TranscriptionWorker(threading.Thread):
                     
                     logger.info(f"Transcribing: {audio_file}")
                     
-                    # Transcribe with Whisper
+                    # Transcribe with standard Python whisper
                     result = self.model.transcribe(
                         audio_file.path,
                         language=self.language,
@@ -710,6 +712,7 @@ class TranscriptionWorker(threading.Thread):
                     )
                     
                     segments = result.get('segments', [])
+                    
                     logger.info(f"Got {len(segments)} segments from transcription")
                     
                     # === KEY FEATURE: Write transcript to file IMMEDIATELY ===
