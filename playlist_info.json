@@ -1,0 +1,29 @@
+{
+  "title": "Single Video: EN VIVO | Con El Mazo Dando | Diosdado Cabello | Programa 548",
+  "id": "P7zdykP0MWA",
+  "url": "https://www.youtube.com/watch?v=P7zdykP0MWA",
+  "total_videos": 1,
+  "downloadable_videos": 1,
+  "max_videos_limit": 1,
+  "videos_to_process": 1,
+  "extracted_at": "2025-10-28T23:42:32.335653",
+  "all_videos": [
+    {
+      "index": 1,
+      "id": "P7zdykP0MWA",
+      "title": "EN VIVO | Con El Mazo Dando | Diosdado Cabello | Programa 548",
+      "url": "https://www.youtube.com/watch?v=P7zdykP0MWA",
+      "duration": 15349,
+      "is_live": false
+    }
+  ],
+  "downloadable_videos_info": [
+    {
+      "index": 1,
+      "id": "P7zdykP0MWA",
+      "title": "EN VIVO | Con El Mazo Dando | Diosdado Cabello | Programa 548",
+      "url": "https://www.youtube.com/watch?v=P7zdykP0MWA",
+      "duration": 15349
+    }
+  ]
+}

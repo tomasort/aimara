@@ -16,6 +16,10 @@ def get_device():
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         print("✅ Metal Performance Shaders (MPS) detected - Using Apple GPU")
         print("   (M1/M2/M3 Mac detected)")
+        print("   Note: Setting MPS fallback to avoid NaN issues")
+        # Set MPS fallback to handle potential NaN issues
+        import os
+        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
         return 'mps'
     
     # Check for CUDA
@@ -67,11 +71,28 @@ def transcribe_audio(audio_file, model_name="medium", device=None, language="es"
         print(f"\n   This may take several minutes, please wait...\n")
         
         # Transcribe with language specification for better accuracy
-        result = model.transcribe(
-            str(audio_path),
-            language=language,
-            verbose=True,  # Show progress
-        )
+        try:
+            result = model.transcribe(
+                str(audio_path),
+                language=language,
+                verbose=True,  # Show progress
+                fp16=False,  # Disable FP16 which can cause issues on MPS
+            )
+        except Exception as transcribe_error:
+            if device == 'mps' and 'nan' in str(transcribe_error).lower():
+                print(f"⚠️  MPS NaN error detected. Falling back to CPU...")
+                print(f"   Original error: {transcribe_error}")
+                
+                # Reload model on CPU
+                model = whisper.load_model(model_name, device='cpu')
+                result = model.transcribe(
+                    str(audio_path),
+                    language=language,
+                    verbose=True,
+                    fp16=False,
+                )
+            else:
+                raise transcribe_error
         
         return result
         
