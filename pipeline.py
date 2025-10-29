@@ -344,16 +344,51 @@ class DownloadProducer(threading.Thread):
         with open(playlist_file, 'w', encoding='utf-8') as f:
             json.dump(playlist_data, f, indent=2, ensure_ascii=False)
     
-    def _mark_video_processed(self, video_id):
-        """Mark a video as processed in the playlist_info.json file."""
+    def _mark_video_processed(self, video_id, failed=False):
+        """
+        Mark a video as processed in the playlist_info.json file.
+        
+        Args:
+            video_id: The video ID to mark
+            failed: Whether the processing failed (default: False for success)
+                   - If failed=False: processed=True, failed=False (successful processing)
+                   - If failed=True: processed=True, failed=True (failed processing, can be retried)
+        """
         playlist_data = self._load_playlist_info()
         if playlist_data:
             for video in playlist_data['videos']:
                 if video['id'] == video_id:
                     video['processed'] = True
-                    logger.info(f"Marked video as processed: {video['title']} ({video_id})")
+                    video['failed'] = failed
+                    status = "failed" if failed else "successfully processed"
+                    logger.info(f"Marked video as {status}: {video['title']} ({video_id})")
                     break
             self._save_playlist_info(playlist_data)
+    
+    def _reset_failed_videos(self):
+        """
+        Reset all failed videos to allow retry attempts.
+        
+        Sets processed=False and failed=False for all videos where failed=True.
+        This allows failed videos to be retried in subsequent runs.
+        """
+        playlist_data = self._load_playlist_info()
+        if not playlist_data:
+            return 0
+        
+        reset_count = 0
+        for video in playlist_data['videos']:
+            if video.get('failed', False):
+                video['processed'] = False
+                video['failed'] = False
+                reset_count += 1
+                logger.info(f"Reset failed video for retry: {video['title']} ({video['id']})")
+        
+        if reset_count > 0:
+            self._save_playlist_info(playlist_data)
+            logger.info(f"Reset {reset_count} failed videos for retry")
+        
+        return reset_count
     
     def _get_ytdlp_options(self, base_options=None):
         """Generate yt-dlp options with cookie support."""
@@ -373,17 +408,29 @@ class DownloadProducer(threading.Thread):
         return options
     
     def _get_next_unprocessed_videos(self, max_count=None):
-        """Get the next unprocessed videos from the playlist."""
+        """
+        Get the next unprocessed videos from the playlist.
+        
+        Selection logic:
+        - Skip videos where processed=True AND failed=False (successfully completed)
+        - Include videos where processed=False (never attempted)
+        - Include videos where processed=True AND failed=True (failed, can retry)
+        
+        This allows failed videos to be retried while avoiding re-processing successful ones.
+        """
         playlist_data = self._load_playlist_info()
         if not playlist_data:
             return []
-        
+
         unprocessed_videos = []
         for video in playlist_data['videos']:
-            # Skip if already processed
-            if video.get('processed', False):
+            # Skip if successfully processed (processed=True AND failed=False)
+            if video.get('processed', False) and not video.get('failed', False):
                 continue
             
+            # Include if:
+            # - Never processed (processed=False)
+            # - Failed processing (processed=True AND failed=True)
             unprocessed_videos.append(video)
             
             # Stop if we have enough videos
@@ -493,9 +540,9 @@ class DownloadProducer(threading.Thread):
                 
                 logger.info(f"Completed video {total_downloaded}: {entry['title']}")
                 
-                # CRITICAL FIX: Mark successful video as processed to prevent infinite retry loop
-                self._mark_video_processed(entry['id'])
-                logger.info(f"Marked successful video as processed: {entry['title']}")
+                # CRITICAL FIX: Mark successful video as processed=True, failed=False
+                self._mark_video_processed(entry['id'], failed=False)
+                logger.info(f"Marked successful video as completed: {entry['title']}")
                 
                 # Brief pause to allow transcription to catch up and prevent overwhelming the system
                 # This helps maintain good flow control between download and transcription stages
@@ -509,9 +556,9 @@ class DownloadProducer(threading.Thread):
             except Exception as e:
                 logger.warning(f"Skipping video {entry['id']} ({entry['title']}) due to download error: {e}")
                 
-                # CRITICAL FIX: Mark failed video as processed to avoid infinite retry loop
-                self._mark_video_processed(entry['id'])
-                logger.info(f"Marked failed video as processed to prevent retry: {entry['title']}")
+                # CRITICAL FIX: Mark failed video as processed=True, failed=True to allow retry
+                self._mark_video_processed(entry['id'], failed=True)
+                logger.info(f"Marked failed video for potential retry: {entry['title']}")
                 continue
         
         # Signal end of downloads
@@ -609,6 +656,7 @@ class DownloadProducer(threading.Thread):
                     'url': f"https://www.youtube.com/watch?v={entry.get('id')}",
                     'duration': entry.get('duration'),
                     'processed': False,  # Track processing status
+                    'failed': False,     # Track failure status - allows retry logic
                 }
                 for entry in filtered_entries
             ]
@@ -1098,6 +1146,41 @@ class Pipeline:
         self.transcripts_dir = self.output_dir / 'transcripts'
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+    
+    def get_playlist_status(self) -> dict:
+        """Get the current status of playlist processing."""
+        playlist_file = self.output_dir / 'playlist_info.json'
+        if not playlist_file.exists():
+            return {'status': 'no_playlist_info', 'total': 0, 'processed': 0, 'failed': 0}
+        
+        with open(playlist_file, 'r', encoding='utf-8') as f:
+            playlist_data = json.load(f)
+        
+        videos = playlist_data.get('videos', [])
+        total = len(videos)
+        processed_successful = sum(1 for v in videos if v.get('processed', False) and not v.get('failed', False))
+        failed = sum(1 for v in videos if v.get('failed', False))
+        pending = total - processed_successful - failed
+        
+        return {
+            'status': 'ready',
+            'total': total,
+            'processed_successful': processed_successful,
+            'failed': failed,
+            'pending': pending,
+            'playlist_title': playlist_data.get('title', 'Unknown'),
+        }
+    
+    def reset_failed_videos(self) -> int:
+        """Reset failed videos to allow retry. Returns number of videos reset."""
+        # Create a temporary downloader just to access the reset method
+        temp_downloader = DownloadProducer(
+            output_queue=None, 
+            playlist_url="", 
+            audio_dir=str(self.audio_dir),
+            extract_info=False
+        )
+        return temp_downloader._reset_failed_videos()
     
     def run(self, playlist_url: str, max_videos: Optional[int] = None,
             whisper_model: str = 'small', language: str = 'es',
